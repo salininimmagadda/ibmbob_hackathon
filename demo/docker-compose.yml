@@ -1,0 +1,94 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15
+    container_name: demo-postgres
+    environment:
+      POSTGRES_USER: aceuser
+      POSTGRES_PASSWORD: acepassword
+      POSTGRES_DB: demo_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database:/docker-entrypoint-initdb.d
+    networks:
+      - ace-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aceuser"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # FlowSmith AI Backend (FastAPI)
+  flowsmith-backend:
+    build: ./flowsmith-ai/backend
+    container_name: flowsmith-backend
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DATABASE_URL=postgresql://aceuser:acepassword@postgres:5432/demo_db
+      - CORS_ORIGINS=http://localhost:3000
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ace-network
+    volumes:
+      - ./flowsmith-ai/backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # FlowSmith AI Frontend (React)
+  flowsmith-frontend:
+    build: ./flowsmith-ai/frontend
+    container_name: flowsmith-frontend
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - flowsmith-backend
+    networks:
+      - ace-network
+    volumes:
+      - ./flowsmith-ai/frontend:/app
+      - /app/node_modules
+    command: npm run dev -- --host
+
+  # ACE Runtime Server (Mock for demo)
+  ace-runtime:
+    image: ibmcom/ace:12.0.9.0-r1
+    container_name: ace-runtime
+    environment:
+      - LICENSE=accept
+      - ACE_SERVER_NAME=DEMO_SERVER
+    ports:
+      - "7800:7800"
+      - "7600:7600"
+      - "4414:4414"
+    volumes:
+      - ./ace-workspace:/home/aceuser/ace-workspace
+      - ./deployment:/home/aceuser/deployment
+      - ace_work:/home/aceuser/ace-server
+    networks:
+      - ace-network
+    command: |
+      bash -c "
+        mqsicreateworkdir /home/aceuser/ace-server &&
+        mqsistart DEMO_NODE &&
+        mqsicreateexecutiongroup DEMO_NODE -e DEMO_SERVER &&
+        tail -f /dev/null
+      "
+
+networks:
+  ace-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  ace_work:
+
+# Made with Bob
