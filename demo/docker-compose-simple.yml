@@ -1,0 +1,53 @@
+version: '3.8'
+
+# Simplified Demo - No OpenAI API Key Required
+# This version runs database and shows pre-generated ACE flows
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15
+    container_name: demo-postgres
+    environment:
+      POSTGRES_USER: aceuser
+      POSTGRES_PASSWORD: acepassword
+      POSTGRES_DB: demo_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database:/docker-entrypoint-initdb.d
+    networks:
+      - ace-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aceuser"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # pgAdmin - Database Management UI
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: demo-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@demo.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - ace-network
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+networks:
+  ace-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  pgadmin_data:
+
+# Made with Bob
