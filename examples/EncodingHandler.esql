@@ -1,0 +1,317 @@
+/*
+ * EncodingHandler.esql
+ * 
+ * Purpose: Handle ASBITSTREAM conversion with CCSID 819 (ISO-8859-1)
+ *          with fallback to Java function for unsupported characters
+ * 
+ * Author: IBM Bob (AI Assistant)
+ * Date: 2026-06-11
+ * 
+ * Requirements:
+ * - Try ASBITSTREAM with CCSID 819
+ * - Catch encoding errors for unsupported characters
+ * - Call Java function to convert unsupported characters
+ * - Return properly encoded bitstream
+ */
+
+CREATE COMPUTE MODULE EncodingHandler_Compute
+    CREATE FUNCTION Main() RETURNS BOOLEAN
+    BEGIN
+        -- Declare variables
+        DECLARE encodedData BLOB;
+        DECLARE originalData CHARACTER;
+        DECLARE conversionSuccess BOOLEAN TRUE;
+        DECLARE errorMessage CHARACTER '';
+        
+        -- Get the input data (adjust path as needed)
+        SET originalData = InputRoot.XMLNSC.Data.Content;
+        
+        -- Try to convert using ASBITSTREAM with CCSID 819
+        BEGIN
+            -- Attempt ASBITSTREAM conversion with CCSID 819 (ISO-8859-1)
+            SET encodedData = ASBITSTREAM(InputRoot.XMLNSC CCSID 819 ENCODING 546);
+            
+            -- If we reach here, conversion was successful
+            SET OutputRoot.BLOB.BLOB = encodedData;
+            SET OutputLocalEnvironment.Variables.EncodingStatus = 'SUCCESS';
+            SET OutputLocalEnvironment.Variables.EncodingMethod = 'ASBITSTREAM_819';
+            
+        EXCEPTION
+            -- Catch encoding errors
+            WHEN SQLSTATE LIKE 'BIP2230%' THEN
+                -- BIP2230E: Error detected whilst processing a message in node
+                -- This typically indicates encoding/conversion issues
+                SET conversionSuccess = FALSE;
+                SET errorMessage = 'Encoding error: Unsupported characters detected for CCSID 819';
+                
+            WHEN SQLSTATE LIKE 'BIP2%' THEN
+                -- General conversion/parsing errors
+                SET conversionSuccess = FALSE;
+                SET errorMessage = 'Conversion error: ' || SQLSTATE || ' - ' || SQLERRORTEXT;
+        END;
+        
+        -- If ASBITSTREAM failed, use Java function fallback
+        IF conversionSuccess = FALSE THEN
+            CALL handleEncodingWithJava(originalData, encodedData, errorMessage);
+        END IF;
+        
+        RETURN TRUE;
+    END;
+
+    /*
+     * Function: handleEncodingWithJava
+     * Purpose: Call Java function to handle unsupported characters
+     * Parameters:
+     *   - inputData: Original character data
+     *   - outputData: Output BLOB (passed by reference)
+     *   - errorMsg: Error message from ASBITSTREAM attempt
+     */
+    CREATE PROCEDURE handleEncodingWithJava(
+        IN inputData CHARACTER,
+        INOUT outputData BLOB,
+        IN errorMsg CHARACTER
+    )
+    BEGIN
+        DECLARE javaResult CHARACTER;
+        DECLARE convertedData CHARACTER;
+        
+        -- Log the encoding issue
+        SET OutputLocalEnvironment.Variables.EncodingStatus = 'FALLBACK_TO_JAVA';
+        SET OutputLocalEnvironment.Variables.OriginalError = errorMsg;
+        
+        -- Call Java function to convert unsupported characters
+        -- The Java function should replace/transliterate unsupported characters
+        SET javaResult = THE(
+            SELECT ITEM result 
+            FROM Database.JavaCharacterConverter(inputData, 819) AS result
+        );
+        
+        -- Alternative: Direct Java method call (if using JavaCompute node)
+        -- SET convertedData = callJavaConverter(inputData);
+        
+        -- Try ASBITSTREAM again with converted data
+        BEGIN
+            SET outputData = ASBITSTREAM(javaResult CCSID 819 ENCODING 546);
+            SET OutputLocalEnvironment.Variables.EncodingMethod = 'JAVA_CONVERTER_819';
+            SET OutputLocalEnvironment.Variables.ConversionSuccess = TRUE;
+            
+            -- Set the output
+            SET OutputRoot.BLOB.BLOB = outputData;
+            
+        EXCEPTION
+            -- If still fails, log error and use UTF-8 as last resort
+            WHEN SQLSTATE LIKE 'BIP%' THEN
+                SET OutputLocalEnvironment.Variables.EncodingMethod = 'UTF8_FALLBACK';
+                SET OutputLocalEnvironment.Variables.ConversionSuccess = FALSE;
+                SET OutputLocalEnvironment.Variables.FinalError = SQLERRORTEXT;
+                
+                -- Use UTF-8 as last resort
+                SET outputData = ASBITSTREAM(javaResult CCSID 1208 ENCODING 546);
+                SET OutputRoot.BLOB.BLOB = outputData;
+        END;
+    END;
+    
+    /*
+     * Alternative: Direct Java method call using CREATE FUNCTION
+     * Uncomment if you prefer this approach
+     */
+    /*
+    CREATE FUNCTION callJavaConverter(IN inputText CHARACTER) 
+        RETURNS CHARACTER
+        LANGUAGE JAVA
+        EXTERNAL NAME "com.ibm.ace.encoding.CharacterConverter.convertToISO88591";
+    */
+    
+END MODULE;
+
+
+/*
+ * Alternative Implementation: Using TryCatch Pattern
+ * This version uses explicit TryCatch nodes in the message flow
+ */
+CREATE COMPUTE MODULE EncodingHandler_TryCatch_Compute
+    CREATE FUNCTION Main() RETURNS BOOLEAN
+    BEGIN
+        DECLARE encodedData BLOB;
+        
+        -- This will be called from the "Try" path
+        -- Attempt ASBITSTREAM with CCSID 819
+        SET encodedData = ASBITSTREAM(InputRoot CCSID 819 ENCODING 546);
+        
+        -- If successful, set output
+        SET OutputRoot.BLOB.BLOB = encodedData;
+        SET OutputLocalEnvironment.Variables.EncodingStatus = 'SUCCESS';
+        
+        RETURN TRUE;
+    END;
+END MODULE;
+
+CREATE COMPUTE MODULE EncodingHandler_Catch_Compute
+    CREATE FUNCTION Main() RETURNS BOOLEAN
+    BEGIN
+        -- This will be called from the "Catch" path when encoding fails
+        DECLARE originalData CHARACTER;
+        DECLARE convertedData CHARACTER;
+        DECLARE encodedData BLOB;
+        
+        -- Get original data
+        SET originalData = CAST(InputRoot.BLOB.BLOB AS CHARACTER CCSID 1208);
+        
+        -- Call Java converter
+        SET convertedData = callJavaCharacterConverter(originalData, 819);
+        
+        -- Convert to BLOB with CCSID 819
+        SET encodedData = ASBITSTREAM(convertedData CCSID 819 ENCODING 546);
+        
+        -- Set output
+        SET OutputRoot.BLOB.BLOB = encodedData;
+        SET OutputLocalEnvironment.Variables.EncodingStatus = 'JAVA_CONVERTED';
+        
+        RETURN TRUE;
+    END;
+    
+    CREATE FUNCTION callJavaCharacterConverter(
+        IN inputText CHARACTER,
+        IN targetCCSID INTEGER
+    ) RETURNS CHARACTER
+    LANGUAGE JAVA
+    EXTERNAL NAME "com.ibm.ace.encoding.CharacterConverter.convert";
+    
+END MODULE;
+
+
+/*
+ * Utility Module: Character Validation
+ * Check if string contains characters not supported in CCSID 819
+ */
+CREATE COMPUTE MODULE EncodingHandler_Validate_Compute
+    CREATE FUNCTION Main() RETURNS BOOLEAN
+    BEGIN
+        DECLARE inputText CHARACTER;
+        DECLARE hasUnsupportedChars BOOLEAN FALSE;
+        DECLARE i INTEGER 1;
+        DECLARE charCode INTEGER;
+        DECLARE currentChar CHARACTER;
+        
+        -- Get input text
+        SET inputText = InputRoot.XMLNSC.Data.Content;
+        
+        -- Check each character
+        WHILE i <= LENGTH(inputText) DO
+            SET currentChar = SUBSTRING(inputText FROM i FOR 1);
+            SET charCode = ASCII(currentChar);
+            
+            -- CCSID 819 (ISO-8859-1) supports characters 0-255
+            -- Characters outside this range need conversion
+            IF charCode > 255 THEN
+                SET hasUnsupportedChars = TRUE;
+                -- Log the problematic character
+                SET OutputLocalEnvironment.Variables.UnsupportedChars[i].Character = currentChar;
+                SET OutputLocalEnvironment.Variables.UnsupportedChars[i].Code = charCode;
+                SET OutputLocalEnvironment.Variables.UnsupportedChars[i].Position = i;
+            END IF;
+            
+            SET i = i + 1;
+        END WHILE;
+        
+        -- Set routing flag
+        IF hasUnsupportedChars THEN
+            SET OutputLocalEnvironment.Variables.RequiresJavaConversion = TRUE;
+            -- Route to Java converter
+            SET OutputRoot = InputRoot;
+        ELSE
+            SET OutputLocalEnvironment.Variables.RequiresJavaConversion = FALSE;
+            -- Route to direct ASBITSTREAM
+            SET OutputRoot = InputRoot;
+        END IF;
+        
+        RETURN TRUE;
+    END;
+END MODULE;
+
+
+/*
+ * Enhanced Version: With Detailed Logging and Error Handling
+ */
+CREATE COMPUTE MODULE EncodingHandler_Enhanced_Compute
+    CREATE FUNCTION Main() RETURNS BOOLEAN
+    BEGIN
+        -- Declare variables
+        DECLARE encodedData BLOB;
+        DECLARE originalData CHARACTER;
+        DECLARE startTime TIMESTAMP CURRENT_TIMESTAMP;
+        DECLARE endTime TIMESTAMP;
+        DECLARE processingTime INTERVAL;
+        
+        -- Get input data
+        SET originalData = InputRoot.XMLNSC.Data.Content;
+        
+        -- Log input details
+        SET OutputLocalEnvironment.Variables.Input.Length = LENGTH(originalData);
+        SET OutputLocalEnvironment.Variables.Input.Timestamp = startTime;
+        
+        -- Attempt primary encoding
+        BEGIN
+            SET encodedData = ASBITSTREAM(InputRoot.XMLNSC CCSID 819 ENCODING 546);
+            
+            -- Success path
+            SET OutputRoot.BLOB.BLOB = encodedData;
+            SET endTime = CURRENT_TIMESTAMP;
+            SET processingTime = endTime - startTime;
+            
+            -- Log success
+            SET OutputLocalEnvironment.Variables.Result.Status = 'SUCCESS';
+            SET OutputLocalEnvironment.Variables.Result.Method = 'ASBITSTREAM_CCSID_819';
+            SET OutputLocalEnvironment.Variables.Result.OutputSize = LENGTH(encodedData);
+            SET OutputLocalEnvironment.Variables.Result.ProcessingTime = CAST(processingTime AS CHARACTER);
+            
+        EXCEPTION
+            WHEN SQLSTATE LIKE 'BIP%' THEN
+                -- Log the error
+                SET OutputLocalEnvironment.Variables.Error.SQLSTATE = SQLSTATE;
+                SET OutputLocalEnvironment.Variables.Error.SQLERRORTEXT = SQLERRORTEXT;
+                SET OutputLocalEnvironment.Variables.Error.Timestamp = CURRENT_TIMESTAMP;
+                
+                -- Call Java fallback
+                CALL performJavaConversion(originalData, encodedData);
+                
+                SET endTime = CURRENT_TIMESTAMP;
+                SET processingTime = endTime - startTime;
+                
+                -- Log fallback success
+                SET OutputLocalEnvironment.Variables.Result.Status = 'FALLBACK_SUCCESS';
+                SET OutputLocalEnvironment.Variables.Result.Method = 'JAVA_CONVERTER';
+                SET OutputLocalEnvironment.Variables.Result.OutputSize = LENGTH(encodedData);
+                SET OutputLocalEnvironment.Variables.Result.ProcessingTime = CAST(processingTime AS CHARACTER);
+        END;
+        
+        RETURN TRUE;
+    END;
+    
+    CREATE PROCEDURE performJavaConversion(
+        IN inputData CHARACTER,
+        INOUT outputData BLOB
+    )
+    BEGIN
+        DECLARE convertedText CHARACTER;
+        
+        -- Call Java converter (adjust class/method name as needed)
+        SET convertedText = THE(
+            SELECT ITEM T.result
+            FROM Database.{
+                'com.ibm.ace.encoding.CharacterConverter'
+            }.convertToISO88591(inputData) AS T
+        );
+        
+        -- Convert to BLOB
+        SET outputData = ASBITSTREAM(convertedText CCSID 819 ENCODING 546);
+        SET OutputRoot.BLOB.BLOB = outputData;
+        
+        -- Log conversion details
+        SET OutputLocalEnvironment.Variables.Conversion.OriginalLength = LENGTH(inputData);
+        SET OutputLocalEnvironment.Variables.Conversion.ConvertedLength = LENGTH(convertedText);
+        SET OutputLocalEnvironment.Variables.Conversion.CharactersChanged = 
+            LENGTH(inputData) - LENGTH(convertedText);
+    END;
+    
+END MODULE;
