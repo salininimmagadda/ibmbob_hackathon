@@ -1,0 +1,144 @@
+BROKER SCHEMA subflows
+
+/**
+ * Monitoring Event OUT Subflow - ESQL Compute Module
+ * Purpose: Create monitoring event with status code "OUT" after output node
+ * Captures final processing status and response data
+ */
+
+CREATE COMPUTE MODULE MonitoringEvent_OUT_Compute
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		-- Copy input message to output
+		SET OutputRoot = InputRoot;
+		
+		-- Get monitoring context from IN event
+		DECLARE businessUniqueId CHARACTER '';
+		DECLARE correlationId CHARACTER '';
+		DECLARE inTimestamp TIMESTAMP;
+		
+		IF EXISTS(Environment.MonitoringEvent[]) THEN
+			SET businessUniqueId = Environment.MonitoringEvent.BusinessUniqueId;
+			SET correlationId = Environment.MonitoringEvent.CorrelationId;
+			SET inTimestamp = Environment.MonitoringEvent.Timestamp;
+		END IF;
+		
+		-- Calculate processing duration
+		DECLARE outTimestamp TIMESTAMP CURRENT_TIMESTAMP;
+		DECLARE processingDuration INTERVAL;
+		DECLARE durationMillis INTEGER 0;
+		
+		IF inTimestamp IS NOT NULL THEN
+			SET processingDuration = outTimestamp - inTimestamp;
+			-- Convert interval to milliseconds
+			SET durationMillis = CAST(processingDuration AS INTEGER) / 1000;
+		END IF;
+		
+		-- Update monitoring event with OUT status
+		IF NOT EXISTS(Environment.MonitoringEvent[]) THEN
+			CREATE LASTCHILD OF Environment.MonitoringEvent AS monEvent NAMESPACE '';
+		END IF;
+		
+		DECLARE monEvent REFERENCE TO Environment.MonitoringEvent;
+		
+		-- Set OUT monitoring event fields
+		SET monEvent.StatusCode = 'OUT';
+		SET monEvent.OutTimestamp = outTimestamp;
+		SET monEvent.ProcessingDurationMs = durationMillis;
+		SET monEvent.FlowName = MessageFlowLabel;
+		SET monEvent.NodeName = 'MonitoringEvent_OUT';
+		
+		-- Preserve existing fields
+		IF businessUniqueId <> '' THEN
+			SET monEvent.BusinessUniqueId = businessUniqueId;
+		END IF;
+		IF correlationId <> '' THEN
+			SET monEvent.CorrelationId = correlationId;
+		END IF;
+		
+		-- Capture response information
+		IF EXISTS(InputLocalEnvironment.Destination.HTTP.RequestIdentifier[]) THEN
+			SET monEvent.ResponseType = 'HTTP';
+			SET monEvent.HTTPStatusCode = InputLocalEnvironment.HTTP.StatusCode;
+		ELSEIF EXISTS(InputLocalEnvironment.Destination.SOAP[]) THEN
+			SET monEvent.ResponseType = 'SOAP';
+		ELSEIF EXISTS(InputLocalEnvironment.Destination.MQ[]) THEN
+			SET monEvent.ResponseType = 'MQ';
+			SET monEvent.DestinationQueue = InputLocalEnvironment.Destination.MQ.DestinationData.queueName;
+		ELSE
+			SET monEvent.ResponseType = 'UNKNOWN';
+		END IF;
+		
+		-- Capture response size
+		IF EXISTS(OutputRoot.BLOB.BLOB[]) THEN
+			SET monEvent.ResponseSize = LENGTH(CAST(OutputRoot.BLOB.BLOB AS CHARACTER));
+		ELSEIF EXISTS(OutputRoot.JSON[]) THEN
+			SET monEvent.ResponseSize = LENGTH(CAST(ASBITSTREAM(OutputRoot.JSON) AS CHARACTER));
+		ELSEIF EXISTS(OutputRoot.XML[]) THEN
+			SET monEvent.ResponseSize = LENGTH(CAST(ASBITSTREAM(OutputRoot.XML) AS CHARACTER));
+		END IF;
+		
+		-- Determine success status
+		DECLARE isSuccess BOOLEAN TRUE;
+		
+		-- Check HTTP status code
+		IF EXISTS(InputLocalEnvironment.HTTP.StatusCode[]) THEN
+			DECLARE httpStatus INTEGER InputLocalEnvironment.HTTP.StatusCode;
+			IF httpStatus >= 400 THEN
+				SET isSuccess = FALSE;
+			END IF;
+		END IF;
+		
+		-- Check for error indicators in response
+		IF EXISTS(OutputRoot.JSON.Data.error[]) OR EXISTS(OutputRoot.JSON.Data.Error[]) THEN
+			SET isSuccess = FALSE;
+		END IF;
+		
+		SET monEvent.Success = isSuccess;
+		SET monEvent.Status = CASE WHEN isSuccess THEN 'SUCCESS' ELSE 'FAILED' END;
+		
+		-- Log monitoring event
+		CALL LogMonitoringEvent(monEvent);
+		
+		RETURN TRUE;
+	END;
+
+	/**
+	 * Log monitoring event to application log
+	 */
+	CREATE PROCEDURE LogMonitoringEvent(IN monEvent REFERENCE)
+	BEGIN
+		DECLARE logMessage CHARACTER;
+		SET logMessage = '[MONITORING-OUT] ' ||
+			'Status=' || monEvent.StatusCode ||
+			', BusinessId=' || COALESCE(monEvent.BusinessUniqueId, 'N/A') ||
+			', CorrelationId=' || COALESCE(monEvent.CorrelationId, 'N/A') ||
+			', Flow=' || monEvent.FlowName ||
+			', Duration=' || CAST(monEvent.ProcessingDurationMs AS CHARACTER) || 'ms' ||
+			', Success=' || CAST(monEvent.Success AS CHARACTER) ||
+			', ResponseType=' || monEvent.ResponseType ||
+			', Timestamp=' || CAST(monEvent.OutTimestamp AS CHARACTER);
+		
+		-- Write to user trace
+		SET Environment.Variables.MonitoringLog = logMessage;
+		
+		-- Optionally send to monitoring queue or database
+		-- CALL SendToMonitoringQueue(monEvent);
+	END;
+
+	/**
+	 * Optional: Send monitoring event to centralized monitoring queue
+	 */
+	CREATE PROCEDURE SendToMonitoringQueue(IN monEvent REFERENCE)
+	BEGIN
+		-- This procedure can be implemented to send monitoring events
+		-- to a centralized monitoring queue for analytics and reporting
+		
+		-- Example implementation:
+		-- PROPAGATE TO TERMINAL 'out' MESSAGE monEvent;
+		
+		-- For now, just log that we would send it
+		SET Environment.Variables.MonitoringQueueSend = 'Would send to monitoring queue';
+	END;
+
+END MODULE;

@@ -1,0 +1,146 @@
+BROKER SCHEMA subflows
+
+/**
+ * Error Handler Subflow - ESQL Compute Module
+ * Purpose: Build error message structure and write to ETS queue
+ * Captures all error details from ExceptionList
+ */
+
+CREATE COMPUTE MODULE ErrorHandler_Compute
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		-- Create error message structure
+		CREATE FIELD OutputRoot.JSON.Data;
+		DECLARE outRef REFERENCE TO OutputRoot.JSON.Data;
+		
+		-- Get monitoring context if available
+		DECLARE businessUniqueId CHARACTER '';
+		DECLARE correlationId CHARACTER '';
+		IF EXISTS(Environment.MonitoringEvent[]) THEN
+			SET businessUniqueId = Environment.MonitoringEvent.BusinessUniqueId;
+			SET correlationId = Environment.MonitoringEvent.CorrelationId;
+		END IF;
+		
+		-- Build error message header
+		SET outRef.ErrorHeader.Timestamp = CAST(CURRENT_TIMESTAMP AS CHARACTER);
+		SET outRef.ErrorHeader.FlowName = MessageFlowLabel;
+		SET outRef.ErrorHeader.NodeName = 'ErrorHandler';
+		SET outRef.ErrorHeader.BusinessUniqueId = businessUniqueId;
+		SET outRef.ErrorHeader.CorrelationId = correlationId;
+		SET outRef.ErrorHeader.MessageId = CAST(InputLocalEnvironment.WrittenDestination.MQ.DestinationData.msgId AS CHARACTER);
+		
+		-- Extract error details from ExceptionList
+		DECLARE errorCount INTEGER 0;
+		DECLARE exceptionRef REFERENCE TO InputExceptionList.*[1];
+		
+		WHILE LASTMOVE(exceptionRef) DO
+			SET errorCount = errorCount + 1;
+			
+			-- Create error detail entry
+			CREATE LASTCHILD OF outRef.ErrorDetails AS errDetail NAMESPACE '';
+			
+			SET errDetail.ErrorNumber = errorCount;
+			SET errDetail.ErrorType = exceptionRef.Label;
+			
+			-- Extract error code
+			IF EXISTS(exceptionRef.Number[]) THEN
+				SET errDetail.ErrorCode = CAST(exceptionRef.Number AS CHARACTER);
+			END IF;
+			
+			-- Extract error text
+			IF EXISTS(exceptionRef.Text[]) THEN
+				SET errDetail.ErrorText = exceptionRef.Text;
+			END IF;
+			
+			-- Extract error insert text (additional details)
+			IF EXISTS(exceptionRef.Insert[]) THEN
+				DECLARE insertRef REFERENCE TO exceptionRef.Insert[1];
+				DECLARE insertText CHARACTER '';
+				WHILE LASTMOVE(insertRef) DO
+					IF insertText <> '' THEN
+						SET insertText = insertText || ' | ';
+					END IF;
+					SET insertText = insertText || COALESCE(CAST(insertRef.Text AS CHARACTER), '');
+					MOVE insertRef NEXTSIBLING;
+				END WHILE;
+				SET errDetail.ErrorInserts = insertText;
+			END IF;
+			
+			-- Capture catalog and severity
+			IF EXISTS(exceptionRef.Catalog[]) THEN
+				SET errDetail.Catalog = exceptionRef.Catalog;
+			END IF;
+			
+			IF EXISTS(exceptionRef.Severity[]) THEN
+				SET errDetail.Severity = CAST(exceptionRef.Severity AS CHARACTER);
+			END IF;
+			
+			-- Move to next exception
+			MOVE exceptionRef NEXTSIBLING;
+		END WHILE;
+		
+		-- Add summary information
+		SET outRef.ErrorSummary.TotalErrors = errorCount;
+		SET outRef.ErrorSummary.Severity = 'ERROR';
+		SET outRef.ErrorSummary.Status = 'FAILED';
+		
+		-- Include original message payload (truncated if too large)
+		DECLARE originalPayload CHARACTER;
+		SET originalPayload = CAST(InputRoot.BLOB.BLOB AS CHARACTER CCSID InputRoot.Properties.CodedCharSetId);
+		
+		IF LENGTH(originalPayload) > 5000 THEN
+			SET outRef.OriginalMessage = SUBSTRING(originalPayload FROM 1 FOR 5000) || '... [TRUNCATED]';
+		ELSE
+			SET outRef.OriginalMessage = originalPayload;
+		END IF;
+		
+		-- Set message properties for ETS queue
+		SET OutputLocalEnvironment.Destination.MQ.DestinationData.queueName = 'ETS.ERROR.QUEUE';
+		SET OutputRoot.Properties.MessageType = 'ERROR';
+		SET OutputRoot.Properties.Persistence = TRUE;
+		
+		RETURN TRUE;
+	END;
+END MODULE;
+
+
+/**
+ * Error Handler Log Module
+ * Purpose: Log error to application log after writing to ETS queue
+ */
+CREATE COMPUTE MODULE ErrorHandler_LogError
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		-- Copy message to output
+		SET OutputRoot = InputRoot;
+		
+		-- Extract error summary for logging
+		DECLARE errorData REFERENCE TO InputRoot.JSON.Data;
+		
+		DECLARE logMessage CHARACTER;
+		SET logMessage = '[ERROR-HANDLER] ' ||
+			'Flow=' || COALESCE(errorData.ErrorHeader.FlowName, 'UNKNOWN') ||
+			', BusinessId=' || COALESCE(errorData.ErrorHeader.BusinessUniqueId, 'N/A') ||
+			', CorrelationId=' || COALESCE(errorData.ErrorHeader.CorrelationId, 'N/A') ||
+			', TotalErrors=' || CAST(errorData.ErrorSummary.TotalErrors AS CHARACTER) ||
+			', Status=' || errorData.ErrorSummary.Status ||
+			', Timestamp=' || errorData.ErrorHeader.Timestamp;
+		
+		-- Log to user trace
+		SET Environment.Variables.ErrorLog = logMessage;
+		
+		-- Log first error detail
+		IF EXISTS(errorData.ErrorDetails.ErrorDetail[1]) THEN
+			DECLARE firstError REFERENCE TO errorData.ErrorDetails.ErrorDetail[1];
+			DECLARE errorDetail CHARACTER;
+			SET errorDetail = '[ERROR-DETAIL] ' ||
+				'Code=' || COALESCE(firstError.ErrorCode, 'N/A') ||
+				', Text=' || COALESCE(firstError.ErrorText, 'N/A') ||
+				', Type=' || COALESCE(firstError.ErrorType, 'N/A');
+			
+			SET Environment.Variables.ErrorDetail = errorDetail;
+		END IF;
+		
+		RETURN TRUE;
+	END;
+END MODULE;

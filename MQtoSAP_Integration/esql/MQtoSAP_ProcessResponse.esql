@@ -1,0 +1,130 @@
+BROKER SCHEMA flows
+
+/**
+ * MQ to SAP Main Flow - Process Response Module
+ * Purpose: Process SAP response and prepare final output
+ */
+
+CREATE COMPUTE MODULE MQtoSAP_ProcessResponse
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		-- Copy input to output
+		SET OutputRoot = InputRoot;
+		
+		-- Get SAP response
+		DECLARE sapResponse REFERENCE TO InputRoot.JSON.Data;
+		
+		-- Check HTTP response status
+		DECLARE httpStatus INTEGER InputLocalEnvironment.HTTP.Input.StatusCode;
+		
+		-- Create standardized response structure
+		CREATE FIELD OutputRoot.JSON.Data;
+		DECLARE outRef REFERENCE TO OutputRoot.JSON.Data;
+		
+		-- Response header
+		SET outRef.ResponseHeader.Timestamp = CAST(CURRENT_TIMESTAMP AS CHARACTER);
+		SET outRef.ResponseHeader.HTTPStatusCode = httpStatus;
+		SET outRef.ResponseHeader.SourceSystem = 'SAP_ERP';
+		
+		-- Get transaction ID from monitoring context
+		IF EXISTS(Environment.MonitoringEvent.BusinessUniqueId[]) THEN
+			SET outRef.ResponseHeader.TransactionId = Environment.MonitoringEvent.BusinessUniqueId;
+			SET outRef.ResponseHeader.CorrelationId = Environment.MonitoringEvent.CorrelationId;
+		END IF;
+		
+		-- Process based on HTTP status
+		IF httpStatus >= 200 AND httpStatus < 300 THEN
+			-- Success response
+			SET outRef.Status = 'SUCCESS';
+			SET outRef.Message = 'SAP request processed successfully';
+			
+			-- Extract SAP response data
+			IF EXISTS(sapResponse.OrderNumber[]) THEN
+				SET outRef.SAPResponse.OrderNumber = sapResponse.OrderNumber;
+			END IF;
+			
+			IF EXISTS(sapResponse.DocumentNumber[]) THEN
+				SET outRef.SAPResponse.DocumentNumber = sapResponse.DocumentNumber;
+			END IF;
+			
+			IF EXISTS(sapResponse.Status[]) THEN
+				SET outRef.SAPResponse.Status = sapResponse.Status;
+			END IF;
+			
+			IF EXISTS(sapResponse.Message[]) THEN
+				SET outRef.SAPResponse.Message = sapResponse.Message;
+			END IF;
+			
+			-- Include full SAP response
+			SET outRef.SAPResponse.FullResponse = sapResponse;
+			
+		ELSEIF httpStatus >= 400 AND httpStatus < 500 THEN
+			-- Client error
+			SET outRef.Status = 'ERROR';
+			SET outRef.ErrorType = 'CLIENT_ERROR';
+			SET outRef.Message = 'SAP request failed - Client error';
+			
+			-- Extract error details from SAP
+			IF EXISTS(sapResponse.error[]) THEN
+				SET outRef.ErrorDetails.Code = sapResponse.error.code;
+				SET outRef.ErrorDetails.Message = sapResponse.error.message;
+				SET outRef.ErrorDetails.Details = sapResponse.error.details;
+			ELSEIF EXISTS(sapResponse.Error[]) THEN
+				SET outRef.ErrorDetails.Code = sapResponse.Error.Code;
+				SET outRef.ErrorDetails.Message = sapResponse.Error.Message;
+				SET outRef.ErrorDetails.Details = sapResponse.Error.Details;
+			ELSE
+				SET outRef.ErrorDetails.Message = 'Unknown client error';
+			END IF;
+			
+		ELSEIF httpStatus >= 500 THEN
+			-- Server error
+			SET outRef.Status = 'ERROR';
+			SET outRef.ErrorType = 'SERVER_ERROR';
+			SET outRef.Message = 'SAP request failed - Server error';
+			
+			-- Extract error details
+			IF EXISTS(sapResponse.error[]) THEN
+				SET outRef.ErrorDetails.Code = sapResponse.error.code;
+				SET outRef.ErrorDetails.Message = sapResponse.error.message;
+			ELSE
+				SET outRef.ErrorDetails.Message = 'SAP server error';
+			END IF;
+			
+		ELSE
+			-- Unexpected status
+			SET outRef.Status = 'UNKNOWN';
+			SET outRef.Message = 'Unexpected HTTP status code: ' || CAST(httpStatus AS CHARACTER);
+		END IF;
+		
+		-- Add processing metadata
+		SET outRef.ProcessingInfo.FlowName = MessageFlowLabel;
+		SET outRef.ProcessingInfo.ProcessedAt = CAST(CURRENT_TIMESTAMP AS CHARACTER);
+		
+		-- Calculate processing time if available
+		IF EXISTS(Environment.MonitoringEvent.Timestamp[]) THEN
+			DECLARE startTime TIMESTAMP Environment.MonitoringEvent.Timestamp;
+			DECLARE endTime TIMESTAMP CURRENT_TIMESTAMP;
+			DECLARE duration INTERVAL endTime - startTime;
+			SET outRef.ProcessingInfo.DurationMs = CAST(duration AS INTEGER) / 1000;
+		END IF;
+		
+		-- Log response processing
+		DECLARE logMessage CHARACTER;
+		SET logMessage = '[SAP-RESPONSE] ' ||
+			'Status=' || outRef.Status ||
+			', HTTPCode=' || CAST(httpStatus AS CHARACTER) ||
+			', TransactionId=' || COALESCE(outRef.ResponseHeader.TransactionId, 'N/A');
+		
+		SET Environment.Variables.ResponseLog = logMessage;
+		
+		-- If error, propagate to failure terminal for error handling
+		IF outRef.Status = 'ERROR' THEN
+			-- Create exception for error handler
+			THROW USER EXCEPTION MESSAGE 2951 
+				VALUES('SAP request failed', outRef.ErrorType, outRef.ErrorDetails.Message);
+		END IF;
+		
+		RETURN TRUE;
+	END;
+END MODULE;

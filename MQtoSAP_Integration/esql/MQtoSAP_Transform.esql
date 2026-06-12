@@ -1,0 +1,94 @@
+BROKER SCHEMA flows
+
+/**
+ * MQ to SAP Main Flow - Transform Module
+ * Purpose: Transform MQ message to SAP format
+ */
+
+CREATE COMPUTE MODULE MQtoSAP_Transform
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		-- Create output message structure for SAP
+		CREATE FIELD OutputRoot.JSON.Data;
+		DECLARE outRef REFERENCE TO OutputRoot.JSON.Data;
+		DECLARE inRef REFERENCE TO InputRoot.JSON.Data;
+		
+		-- Transform message to SAP format
+		-- This is a template - adjust based on your actual SAP API requirements
+		
+		-- SAP Header Information
+		SET outRef.SAPHeader.MessageType = 'ORDER_CREATE';
+		SET outRef.SAPHeader.Timestamp = CAST(CURRENT_TIMESTAMP AS CHARACTER);
+		SET outRef.SAPHeader.SourceSystem = 'MQ_INTEGRATION';
+		SET outRef.SAPHeader.TargetSystem = 'SAP_ERP';
+		
+		-- Get business unique ID from monitoring context
+		IF EXISTS(Environment.MonitoringEvent.BusinessUniqueId[]) THEN
+			SET outRef.SAPHeader.TransactionId = Environment.MonitoringEvent.BusinessUniqueId;
+		ELSE
+			SET outRef.SAPHeader.TransactionId = CAST(UUIDASCHAR AS CHARACTER);
+		END IF;
+		
+		-- Transform business data
+		-- Example: Order data transformation
+		IF EXISTS(inRef.order[]) THEN
+			SET outRef.Order.OrderNumber = inRef.order.orderNumber;
+			SET outRef.Order.OrderDate = inRef.order.orderDate;
+			SET outRef.Order.CustomerNumber = inRef.order.customerId;
+			SET outRef.Order.TotalAmount = inRef.order.totalAmount;
+			SET outRef.Order.Currency = COALESCE(inRef.order.currency, 'USD');
+			
+			-- Transform order items
+			DECLARE itemCount INTEGER 1;
+			DECLARE itemRef REFERENCE TO inRef.order.items.item[1];
+			
+			WHILE LASTMOVE(itemRef) DO
+				CREATE LASTCHILD OF outRef.Order.Items AS sapItem NAMESPACE '';
+				
+				SET sapItem.ItemNumber = itemCount;
+				SET sapItem.MaterialNumber = itemRef.productId;
+				SET sapItem.Quantity = itemRef.quantity;
+				SET sapItem.UnitPrice = itemRef.unitPrice;
+				SET sapItem.TotalPrice = itemRef.quantity * itemRef.unitPrice;
+				SET sapItem.UnitOfMeasure = COALESCE(itemRef.uom, 'EA');
+				
+				SET itemCount = itemCount + 1;
+				MOVE itemRef NEXTSIBLING;
+			END WHILE;
+		ELSE
+			-- Generic data transformation if no specific structure
+			SET outRef.Data = inRef;
+		END IF;
+		
+		-- Set HTTP headers for SAP request
+		SET OutputLocalEnvironment.Destination.HTTP.RequestURL = COALESCE(
+			Environment.Variables.SAP_ENDPOINT,
+			'https://sap-server.example.com/api/orders'
+		);
+		
+		-- SAP authentication headers
+		SET OutputRoot.HTTPRequestHeader."Content-Type" = 'application/json';
+		SET OutputRoot.HTTPRequestHeader."Accept" = 'application/json';
+		
+		-- Add SAP authentication (adjust based on your SAP setup)
+		-- Option 1: Basic Auth
+		DECLARE sapUser CHARACTER COALESCE(Environment.Variables.SAP_USER, 'sapuser');
+		DECLARE sapPass CHARACTER COALESCE(Environment.Variables.SAP_PASS, 'sappass');
+		DECLARE authString CHARACTER sapUser || ':' || sapPass;
+		DECLARE encodedAuth CHARACTER BASE64ENCODE(CAST(authString AS BLOB CCSID 1208));
+		SET OutputRoot.HTTPRequestHeader."Authorization" = 'Basic ' || encodedAuth;
+		
+		-- Option 2: OAuth Token (uncomment if using OAuth)
+		-- SET OutputRoot.HTTPRequestHeader."Authorization" = 'Bearer ' || Environment.Variables.SAP_TOKEN;
+		
+		-- Add custom SAP headers if required
+		SET OutputRoot.HTTPRequestHeader."X-SAP-Client" = '100';
+		SET OutputRoot.HTTPRequestHeader."X-Correlation-ID" = Environment.MonitoringEvent.CorrelationId;
+		
+		-- Log transformation
+		SET Environment.Variables.TransformLog = 'Transformed message for SAP: TransactionId=' || 
+			outRef.SAPHeader.TransactionId;
+		
+		RETURN TRUE;
+	END;
+END MODULE;
